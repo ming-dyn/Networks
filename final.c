@@ -68,13 +68,13 @@ void response_reset(response_from_server *response);
 cache_ele* cache_find(char *key);
 cache_ele* cache_next_free();
 cache_ele* cache_new_or_update(cache_ele* node, request_from_client *req);
-void server_get(response_from_server* response, request_from_client *req);
-void response_parse(cache_ele *node);
+void server_get(cache_ele *node, request_from_client *req);
+void response_parse(cache_ele *node, int len);
 
 // TO be implemented
 void cache_refresh(); // active cache reset
 void destory();
-void server_get_head(); // TODO: get the head and parse the content-length to fasten the process
+//void server_get_head(); // TODO: get the head and parse the content-length to fasten the process
 
 
 int main(int argc, char **argv) {
@@ -465,14 +465,14 @@ cache_ele* cache_new_or_update(cache_ele* node, request_from_client *req) {
   }
   
   // update value and expiration_time
-  server_get(node->value, req);
-  response_parse(node);
+  server_get(node, req);
   
   // return the node
   return node;
 }
 
-void server_get(response_from_server* response, request_from_client *req) {
+void server_get(cache_ele *node, request_from_client *req) {
+  response_from_server* response = node->value;
   struct hostent *server;
   int sock_fd;
   struct sockaddr_in server_addr;
@@ -481,7 +481,7 @@ void server_get(response_from_server* response, request_from_client *req) {
   // socket: create the socket
   sock_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (sock_fd < 0) {
-    perror("ERROR opening socket");
+    perror("ERROR opening socket\n");
     exit(EXIT_FAILURE);
   }
   
@@ -500,7 +500,7 @@ void server_get(response_from_server* response, request_from_client *req) {
   
   // connect: create a connection with the server
   if (connect(sock_fd, (struct sockaddr *) &server_addr, sizeof(server_addr)) < 0) {
-    perror("ERROR connecting");
+    perror("ERROR connecting\n");
     exit(EXIT_FAILURE);      
   }
   
@@ -508,7 +508,7 @@ void server_get(response_from_server* response, request_from_client *req) {
   nbytes = write(sock_fd, req->msg, strlen(req->msg));
   //printf("Write msg:[\n%s\n] to the server\n", req->msg);
   if (nbytes < 0 || strlen(req->msg) != nbytes) {
-    perror("ERROR writing to socket");
+    perror("ERROR writing to server socket\n");
     exit(EXIT_FAILURE);
   }
   
@@ -517,14 +517,27 @@ void server_get(response_from_server* response, request_from_client *req) {
   nbytes = 0;
   char *tmp_buf = response->msg;
   int tmp_n = read(sock_fd, tmp_buf, RESPONSE_MSG_SIZE);
+  
   while (tmp_n > 0) {
     printf("Read %d bytes from the server\n", tmp_n);
+    
     tmp_buf += tmp_n;
     nbytes += tmp_n;
+    
+    // try to get the content-length so that we can know when the read() is over
+    if (response->body_len == 0) {
+      response_parse(node, nbytes);
+    }
+    
+    // check if it is the last read
+    if (response->body_len != 0 && nbytes == response->body - response->msg + response->body_len) {
+      break;
+    }
+    
     tmp_n = read(sock_fd, tmp_buf, RESPONSE_MSG_SIZE - nbytes);
   }
   if (tmp_n < 0) {
-    perror("ERROR reading from socket");
+    perror("ERROR reading from socket\n");
     exit(EXIT_FAILURE);
   }
   
@@ -534,7 +547,7 @@ void server_get(response_from_server* response, request_from_client *req) {
   close(sock_fd);
 }
 
-void response_parse(cache_ele *node) {
+void response_parse(cache_ele *node, int len) {
   int len_cache_ctrl = 15;
   int len_content = 16;
   int len_max_age = 8;
@@ -543,7 +556,9 @@ void response_parse(cache_ele *node) {
   char max_age[8] = "max-age=";
   char *res_buf = node->value->msg;
   long cur_time = time(NULL);
-  node->expiration_time = cur_time + DEFAULT_CACHE_AGE;
+  
+  long parsed_expir_time = cur_time + DEFAULT_CACHE_AGE;;
+  long parsed_body_len = 0;
   
   /* Test
   for (int i = 0; i < node->value->msg_len; i++) {
@@ -553,7 +568,7 @@ void response_parse(cache_ele *node) {
   printf("\n");
   */
   
-  for (int i = 0; i < node->value->msg_len; i++) {
+  for (int i = 0; i < len; i++) {
     char *line = res_buf + i;
     
     // the separting line between header and body '\r\n'
@@ -563,7 +578,10 @@ void response_parse(cache_ele *node) {
       i++; // '\n'
       node->value->body = res_buf + i + 1;
       
-      break; // only to parse the info in the header
+      // only to parse the info in the header and only assign values when reached this blank line
+      node->value->body_len = parsed_body_len;
+      node->expiration_time = parsed_expir_time;
+      break;
     // get content-length
     } else if (contains_chars(line, content_len, len_content)) {
       for (int k = 0; line[k] != '\n'; k++) {
@@ -580,7 +598,8 @@ void response_parse(cache_ele *node) {
       tmp_len[j] = '\0';
       i++; // '\n'
       
-      node->value->body_len = atol(tmp_len);
+      //node->value->body_len = atol(tmp_len);
+      parsed_body_len = atol(tmp_len);
       printf("Expect %ld bytes body from the server\n", node->value->body_len);
     // get max-age in Cache-Control
     } else if (contains_chars(line, cache_ctrl, len_cache_ctrl)) {
@@ -599,7 +618,8 @@ void response_parse(cache_ele *node) {
             tmp_age[j++] = res_buf[i++];
           }
           tmp_age[j] = '\0';
-          node->expiration_time = cur_time + atol(tmp_age);
+          //node->expiration_time = cur_time + atol(tmp_age);
+          parsed_expir_time = cur_time + atol(tmp_age);
           
           printf("Expiration at %ld\n", node->expiration_time);
         } else {
