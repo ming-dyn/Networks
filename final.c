@@ -70,6 +70,7 @@ cache_ele* cache_next_free();
 cache_ele* cache_new_or_update(cache_ele* node, request_from_client *req);
 void server_get(cache_ele *node, request_from_client *req);
 void response_parse(cache_ele *node, int len);
+void run_connect_meth(int filedes, request_from_client *req);
 
 // TO be implemented
 void cache_refresh(); // active cache reset
@@ -143,6 +144,12 @@ int main(int argc, char **argv) {
           fprintf(stderr, "\nServer: connect from host %s, port %hd.\n",
                   inet_ntoa(clientname.sin_addr), ntohs(clientname.sin_port));
           FD_SET(new, &active_fd_set);
+          
+          // set 100 ms read timeout for the client
+          struct timeval tv;
+          tv.tv_sec = 0;
+          tv.tv_usec = 100000;
+          setsockopt(new, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
         } else {
           //printf("\nSocket %d is being processed, current time %ld\n", i, time(NULL));
           
@@ -266,7 +273,14 @@ void client_get_request(int filedes, fd_set *active_fd_set) {
         return;
       }
       
-      //get the response from cache
+      // handle CONNECT request
+      if (request->request_method[0] == 'C') {
+        run_connect_meth(filedes, request);
+        client_finish(filedes, active_fd_set);
+        return;
+      }
+      
+      // get the response from cache for GET request
       response_from_server *response = cache_get(request);
       
       // write response to client
@@ -298,13 +312,16 @@ request_from_client* request_parse(request_buffer *req_buf) {
   
   int get_len = 4;
   int host_len = 6;
+  int connect_len = 8;
+  char connect_header[8] = "CONNECT ";
   char get_header[4] = "GET ";
   char host_header[6] = "Host: ";
   
   for (int i = 0; i < req_buf->msg_len; i++) {
     char *line = req_buf->buffer + i;
-    if (contains_chars(line, get_header, get_len)) {
-      printf("Parsing GET method\n");
+    if (contains_chars(line, get_header, get_len)
+        || contains_chars(line, connect_header, connect_len)) {
+      printf("Parsing HTTP request method\n");
       
       int j = 0;
       while (req_buf->buffer[i] != '\r') {
@@ -317,18 +334,22 @@ request_from_client* request_parse(request_buffer *req_buf) {
       }
       i++; // now is '\n'
       request->request_method[j] = '\0';
-      printf("Get method is:[%s]\n", request->request_method);
+      printf("HTTP request method is:[%s]\n", request->request_method);
     } else if (contains_chars(line, host_header, host_len)) {
       printf("Parsing host name\n");
       
       i += host_len;
       int j = 0;
-      while (req_buf->buffer[i] != '\r') {
+      while (req_buf->buffer[i] != '\r' && req_buf->buffer[i] != ':') {
         request->host_name[j++] = req_buf->buffer[i++];
       }
       request->host_name[j] = '\0';
       printf("Host is:[%s]\n", request->host_name);
-      i++; // now is '\n'
+      
+      while (req_buf->buffer[i] != '\n') {
+        i++;
+      }
+      // now is '\n'
     } else {
       // neglect this line
       while (req_buf->buffer[i] != '\n') {
@@ -634,4 +655,88 @@ void response_parse(cache_ele *node, int len) {
       }
     }
   }
+}
+
+void run_connect_meth(int filedes, request_from_client *req) {
+  struct hostent *server;
+  int sock_fd;
+  struct sockaddr_in server_addr;
+  int nbytes;
+  char msg_buf[5000];
+  char reply[] = "HTTP/1.1 200 Connection Established\r\nProxy-Agent: MyProxy/0.1\r\n\r\n";
+  
+  // write response to client
+  nbytes = write(filedes, reply, strlen(reply));
+  printf("Write %d bytes data to client\n", nbytes);
+  if (nbytes != strlen(reply)) {
+    perror("ERROR writing to client socket\n");
+    exit(EXIT_FAILURE);
+  }
+  
+  // get request from client
+  bzero(msg_buf, 5000);
+  nbytes = read(filedes, msg_buf, 5000);
+  printf("Get %d bytes data request from client\n", nbytes);
+  
+  // socket: create the socket to connect the server
+  sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (sock_fd < 0) {
+    perror("ERROR opening socket\n");
+    exit(EXIT_FAILURE);
+  }
+  
+  // gethostbyname: get the server's DNS entry
+  server = gethostbyname(req->host_name);
+  if (server == NULL) {
+    fprintf(stderr,"ERROR, no such host as %s\n", req->host_name);
+    exit(0);
+  }
+  
+  // build the server's Internet address
+  bzero((char *) &server_addr, sizeof(server_addr));
+  server_addr.sin_family = AF_INET;
+  bcopy((char *)server->h_addr, (char *)&server_addr.sin_addr.s_addr, server->h_length);
+  server_addr.sin_port = htons(req->port_num);
+  
+  // connect: create a connection with the server
+  if (connect(sock_fd, (struct sockaddr *) &server_addr, sizeof(server_addr)) < 0) {
+    perror("ERROR connecting\n");
+    exit(EXIT_FAILURE);      
+  }
+  
+  // send the request to the server
+  nbytes = write(sock_fd, msg_buf, nbytes);
+  printf("Forward %d bytes data request to the server\n", nbytes);
+  
+  // begin to get data
+  printf("Begin to get msg body from the server\n", nbytes);
+  bzero(msg_buf, 5000);
+  nbytes = read(sock_fd, msg_buf, 5000);
+  
+  // wait for the last ACK is complete
+  while (nbytes > 0) {
+    // write to the client
+    nbytes = write(filedes, msg_buf, nbytes);
+    printf("Forward %d bytes to the client\n", nbytes);
+    
+    
+    // attempt read the reply from client
+    bzero(msg_buf, 5000);
+    nbytes = read(filedes, msg_buf, 5000);
+    if (nbytes > 0) {
+      printf("Get %d bytes data from the client: Connection-Ack\n", nbytes);
+      // forward the reply to the server
+      nbytes = write(sock_fd, msg_buf, nbytes);
+      printf("Forward %d bytes data request to the server\n", nbytes);
+    }
+    
+    
+    // read from the server
+    bzero(msg_buf, 5000);
+    nbytes = read(sock_fd, msg_buf, 5000);
+  }
+  
+  printf("Finished CONNECT!\n");
+  
+  close(sock_fd);
 }
