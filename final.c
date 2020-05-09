@@ -16,17 +16,22 @@
 #define RESPONSE_MSG_SIZE 10000000
 #define DEFAULT_CACHE_AGE 3600
 #define CACHE_CAP 20
-#define REQUEST_BUFFER_TIMEOUT_SECONDS 60
+#define FD_TIMEOUT_SECONDS 60
+#define RD_WR_BUFFER_SIZE 1000
 
-/* struct of the buffer */
+// idle buffer: fd_id = 0
+// buffer fram cache: fd_id = FD_SETSIZE to (FD_SETSIZE + CACHE_CAP)
 typedef struct {
   int fd_id;
-  char buffer[REQUEST_BUFFER_SIZE];
-  long last_modified_time;
-  int msg_len;
-} request_buffer;
+  char *buffer;
+  int size;
+  int size_written;
+} rd_wr_buffer;
+rd_wr_buffer **rd_wr_buffers;
+rd_wr_buffer **write_buffer_lookup;
 
 typedef struct {
+  bool is_get_request;
   int port_num;
   char host_name[EACH_HEADER_SIZE]; // '\0' terminated
   char request_method[EACH_HEADER_SIZE]; // '\0' terminated
@@ -41,25 +46,25 @@ typedef struct {
 } response_from_server;
 
 typedef struct {
+  int id;
   char key[EACH_HEADER_SIZE]; // '\0' terminated
   response_from_server *value;
   long expiration_time;
 } cache_ele;
-
-request_buffer **request_buf_arr;
 cache_ele **cache_arr;
 
+long *fd_last_mod_time;
+
+
+void init();
+void rd_wr_buf_init();
+void rd_wr_buf_new(int fd_id);
+void rd_wr_buf_reset(rd_wr_buffer *buf);
 int make_socket(uint16_t port);
-bool is_header_end(char *str, int len);
+bool is_request_end(char *str, int len);
 int parse_port_number(char *str);
-void client_get_request(int filedes, fd_set *active_fd_set);
-request_from_client* request_parse(request_buffer *req_buf);
+request_from_client* request_parse(rd_wr_buffer *req_buf);
 bool contains_chars(char *ptr, char *header, int len);
-void request_buf_init();
-void request_buf_new(int filedes);
-void request_buf_reset(request_buffer *req_buf);
-void client_finish(int filedes, fd_set *active_fd_set);
-response_from_server* cache_get(request_from_client *req);
 void cache_init();
 cache_ele* cache_new();
 void cache_reset(cache_ele *cache);
@@ -67,20 +72,20 @@ response_from_server* response_new();
 void response_reset(response_from_server *response);
 cache_ele* cache_find(char *key);
 cache_ele* cache_next_free();
-cache_ele* cache_new_or_update(cache_ele* node, request_from_client *req);
-void server_get(cache_ele *node, request_from_client *req);
+cache_ele* cache_new_or_reset(cache_ele* node, request_from_client *req);
 void response_parse(cache_ele *node, int len);
-void run_connect_meth(int filedes, request_from_client *req);
+void process_client_request(int fd_id);
+rd_wr_buffer* process_get_request(request_from_client *req, rd_wr_buffer* write_buf);
+rd_wr_buffer* process_connect_request(request_from_client *req, rd_wr_buffer* write_buf);
+int connect_server(request_from_client *req);
 
 // TO be implemented
 void cache_refresh(); // active cache reset
 void destory();
-//void server_get_head(); // TODO: get the head and parse the content-length to fasten the process
 
 
 int main(int argc, char **argv) {
   int main_sock;
-  fd_set active_fd_set, read_fd_set;
   struct sockaddr_in clientname;
   int proxy_port_no; // port to listen on
   
@@ -101,72 +106,294 @@ int main(int argc, char **argv) {
   }
   printf("Create the main socket with ID %d\n", main_sock);
   
-  /* Initialize the set of active sockets. */
-  FD_ZERO(&active_fd_set);
-  printf("Initial FD_SETSIZE is %d\n", FD_SETSIZE);
-  FD_SET(main_sock, &active_fd_set);
-  printf("After main socket, FD_SETSIZE is %d\n", FD_SETSIZE);
+  init();
   
-  /* Init buffers */
-  request_buf_init();
-  cache_init();
+  // init timeout
   
-  /* Initialize the Timeout */
-  struct timeval interval; // refresh for each interval
-  interval.tv_sec = 1;
-  interval.tv_usec = 0;
-  
+  fd_set read_fd_set, write_fd_set;
   /* run the proxy */
   while (1) {
-    /* Block until input arrives on one or more active sockets, or timeout
-       expries. */
-    read_fd_set = active_fd_set;
-    if (select(FD_SETSIZE, &read_fd_set, NULL, NULL, &interval) < 0) {
+    printf("\n Begin to select\n");
+    int max_fd = main_sock;
+    FD_ZERO(&read_fd_set);
+    FD_ZERO(&write_fd_set);
+    FD_SET(main_sock, &read_fd_set);
+    long cur_time = time(NULL);
+    
+    // init read and write set and max_fd
+    for (int i = 1; i < FD_SETSIZE; ++i) {
+      // ignore fd_id with no connection
+      long fd_time = fd_last_mod_time[i];
+      if (fd_time == 0) {
+        continue;
+      }
+      
+      rd_wr_buffer *read_buf = rd_wr_buffers[i];
+      rd_wr_buffer *write_buf = write_buffer_lookup[i];
+      int cache_index = read_buf->fd_id - FD_SETSIZE;
+      
+      // reset buffer if timeout for interaction with proxy
+      if (cur_time - fd_time >= FD_TIMEOUT_SECONDS) {
+        shutdown(i, SHUT_RDWR);
+        close(i);
+        fd_last_mod_time[i] = 0;
+        write_buffer_lookup[i] = NULL;
+        
+        if (cache_index >= 0) {
+          cache_reset(cache_arr[cache_index]);
+          free(read_buf);
+        } else {
+          rd_wr_buf_reset(read_buf);
+        }
+        
+        continue;
+      }
+        
+      // set read when there is space
+      if (read_buf->size < RD_WR_BUFFER_SIZE || cache_index >= 0) {
+        printf("Setting %d to the read_set\n", i);
+        FD_SET(i, &read_fd_set);
+        max_fd = max_fd > i ? max_fd : i;
+      }
+      
+      // set write if possible
+      if (write_buf != NULL && write_buf->size > write_buf->size_written) {
+        printf("Setting %d to the write_set\n", i);
+        FD_SET(i, &write_fd_set);
+        max_fd = max_fd > i ? max_fd : i;
+      }
+    }
+    
+    /* Block until input arrives on one or more active sockets */
+    if (select(max_fd + 1, &read_fd_set, &write_fd_set, NULL, NULL) < 0) {
       perror("select");
       exit(EXIT_FAILURE);
     }
+    
+    printf("Selected\n");
 
     /* Service all the sockets with input pending or close any socket w partial
        data >= 1min */
-    for (int i = 0; i < FD_SETSIZE; ++i) {
-      // respond to the socket
-      if (FD_ISSET(i, &read_fd_set)) {
-        // main socket is ready which means new client is connecting
-        if (i == main_sock) {
-          printf("Main socket %d is being processed\n", i);
-          /* Connection request on original/main socket. */
+    
+    // serve all active fd_id
+    for (int i = 1; i <= max_fd; ++i) {
+      int num_bytes;
+      
+      if (i == main_sock) {
+        /* Connection request on original/main socket. */
+        if (FD_ISSET(main_sock, &read_fd_set)) {
           int size = sizeof(clientname);
           int new = accept(main_sock, (struct sockaddr *) &clientname, &size);
           if (new < 0) {
             perror("accept");
             exit(EXIT_FAILURE);
           }
-          fprintf(stderr, "\nServer: connect from host %s, port %hd.\n",
-                  inet_ntoa(clientname.sin_addr), ntohs(clientname.sin_port));
-          FD_SET(new, &active_fd_set);
           
-          // set 100 ms read timeout for the client
-          struct timeval tv;
-          tv.tv_sec = 0;
-          tv.tv_usec = 100000;
-          setsockopt(new, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
-        } else {
-          //printf("\nSocket %d is being processed, current time %ld\n", i, time(NULL));
+          printf("Server: connect from client with fd_id=%d\n", new);
+          fd_last_mod_time[new] = time(NULL);
           
-          /* Data arriving on an already-connected socket. */
-          client_get_request(i, &active_fd_set);
-          
-          //printf("modified_time: %ld\n", msg_buffer_ptr[i].modified_time);
+          // init buffer
+          if (rd_wr_buffers[new] == NULL) {
+            rd_wr_buf_new(new);
+          } else {
+            // TODO: do we need to reset the rd_wr_buffer here? Yes, but why?
+            rd_wr_buf_reset(rd_wr_buffers[new]);
+            write_buffer_lookup[new] = NULL;
+          }
         }
-      } else if (request_buf_arr[i] != NULL && request_buf_arr[i]->fd_id != -1) {
-        // CLose any client which is idle for >= 1 min
-        if (time(NULL) - request_buf_arr[i]->last_modified_time >= REQUEST_BUFFER_TIMEOUT_SECONDS) {
-          request_buf_reset(request_buf_arr[i]);
-          printf("Reset the buffer with client id %d due to timeout\n", i);
+        continue;
+      }
+      
+      // read to the buffer
+      if (FD_ISSET(i, &read_fd_set)) {
+        printf("Processing read for fd of id %d\n", i);
+        
+        int cache_index = rd_wr_buffers[i]->fd_id - FD_SETSIZE;
+        fd_last_mod_time[i] = time(NULL);
+        
+        if (cache_index >= 0) {
+          // assume our cache will never be full
+          num_bytes = read(i, rd_wr_buffers[i]->buffer + rd_wr_buffers[i]->size,
+                               RD_WR_BUFFER_SIZE);
+          
+          if (num_bytes >= 1) {
+            cache_ele *the_cache = cache_arr[cache_index];
+            response_from_server* response = the_cache->value;
+            response->msg_len += num_bytes;
+            
+            printf("Read %d bytes to cache\n", num_bytes);
+            rd_wr_buffers[i]->size += num_bytes;
+            
+            // try to parse the response header
+            if (response->body_len == 0) {
+              response_parse(the_cache, response->msg_len);
+            }
+          }
+        } else {
+          num_bytes = read(i, rd_wr_buffers[i]->buffer + rd_wr_buffers[i]->size,
+                               RD_WR_BUFFER_SIZE - rd_wr_buffers[i]->size);
+          
+          if (num_bytes >= 1) {
+            printf("Read %d bytes to the buffer of fd_id %d\n", num_bytes, i);
+            rd_wr_buffers[i]->size += num_bytes;
+            
+            // only process when it is the 1st request from client
+            if (write_buffer_lookup[i] == NULL) {
+              // validate, parse and send request/reply, find its write_buf
+              process_client_request(i);
+            }
+          }
+        }
+        
+        if (num_bytes < 1) {
+          printf("The connection with fd_id %d is closed.\n", i);
+          fd_last_mod_time[i] = 0;
+          
+          // shut fd and close the connection
+          shutdown(i, SHUT_RDWR);
+          close(i);
+        }
+      }
+      
+      // write to the buffer or cache
+      if (FD_ISSET(i, &write_fd_set)) {
+        printf("Processing write for fd of id %d\n", i);
+        
+        rd_wr_buffer *write_buf = write_buffer_lookup[i];
+        
+        num_bytes = write_buf->size - write_buf->size_written;
+        num_bytes = RD_WR_BUFFER_SIZE >= num_bytes ? num_bytes : RD_WR_BUFFER_SIZE; // if from cache
+        
+        if (write(i, write_buf->buffer + write_buf->size_written, num_bytes) != num_bytes) {
+          perror("Write error\n");
+          // TODO shut fd
+        }
+        
+        write_buf->size_written += num_bytes;
+        fd_last_mod_time[i] = time(NULL);
+        
+        if (write_buf->fd_id >= FD_SETSIZE) {
+          printf("Write %d bytes of data out of cache to fd_id %d\n", num_bytes, i);
+        } else {
+          printf("Write %d bytes of data out of buffer to fd_id %d\n", num_bytes, i);
+        }
+        
+        // check if write buffer is full
+        if (write_buf->fd_id < FD_SETSIZE && write_buf->size_written == RD_WR_BUFFER_SIZE) {
+          write_buf->size_written = write_buf->size = 0;
         }
       }
     }
   }
+}
+
+void init() {
+  rd_wr_buf_init();
+  cache_init();
+  fd_last_mod_time = (long *) calloc(FD_SETSIZE, sizeof(long));
+}
+
+int connect_server(request_from_client *req) {
+  struct hostent *server;
+  int sock_fd;
+  struct sockaddr_in server_addr;
+  
+  // socket: create the socket
+  sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (sock_fd < 0) {
+    perror("ERROR opening socket\n");
+    exit(EXIT_FAILURE);
+  }
+  
+  // gethostbyname: get the server's DNS entry
+  server = gethostbyname(req->host_name);
+  if (server == NULL) {
+    fprintf(stderr,"ERROR, no such host as %s\n", req->host_name);
+    exit(0);
+  }
+  
+  // build the server's Internet address
+  bzero((char *) &server_addr, sizeof(server_addr));
+  server_addr.sin_family = AF_INET;
+  bcopy((char *)server->h_addr, (char *)&server_addr.sin_addr.s_addr, server->h_length);
+  server_addr.sin_port = htons(req->port_num);
+  
+  // connect: create a connection with the server
+  if (connect(sock_fd, (struct sockaddr *) &server_addr, sizeof(server_addr)) < 0) {
+    perror("ERROR connecting\n");
+    exit(EXIT_FAILURE);      
+  }
+  
+  return sock_fd;
+}
+
+void process_client_request(int fd_id) {
+  rd_wr_buffer *read_buf = rd_wr_buffers[fd_id];
+  
+  // parse the request
+  request_from_client *req = request_parse(read_buf);
+  
+  if (req != NULL) {
+    // if it is a GET request
+    if (req->is_get_request == true) {
+      write_buffer_lookup[fd_id] = process_get_request(req, read_buf);
+    } else {
+      write_buffer_lookup[fd_id] = process_connect_request(req, read_buf);
+    }
+  }
+}
+
+rd_wr_buffer* process_get_request(request_from_client *req, rd_wr_buffer* write_buf) {
+  // find the GET request in the cache first
+  cache_ele* res_cache = cache_find(req->request_method);
+  rd_wr_buffer *res_buf = (rd_wr_buffer *) malloc(sizeof(rd_wr_buffer));
+  long cur_time = time(NULL);
+  
+  // if cache value not exist or out-dated
+  if (res_cache == NULL
+      || res_cache->expiration_time <= cur_time) {
+    printf("No result in the cache or content expried\n");
+    // create an empty content cache
+    res_cache = cache_new_or_reset(res_cache, req);
+    
+    // create fd for server
+    int server_fd = connect_server(req);
+    rd_wr_buffers[server_fd] = res_buf;
+    write_buffer_lookup[server_fd] = write_buf;
+    fd_last_mod_time[server_fd] = cur_time;
+    
+    printf("Connected to server with fd id=%d\n", server_fd);
+  }
+  
+  res_buf->fd_id = FD_SETSIZE + res_cache->id;
+  res_buf->buffer = res_cache->value->msg;
+  res_buf->size = res_cache->value->msg_len;
+  res_buf->size_written = 0;
+  
+  return res_buf;
+}
+
+rd_wr_buffer* process_connect_request(request_from_client *req, rd_wr_buffer* write_buf) {  
+  // create fd for server
+  int server_fd = connect_server(req);
+  fd_last_mod_time[server_fd] = time(NULL);
+  write_buffer_lookup[server_fd] = write_buf;
+  
+  if (rd_wr_buffers[server_fd] == NULL) {
+    rd_wr_buf_new(server_fd);
+  }
+  rd_wr_buf_reset(rd_wr_buffers[server_fd]);
+  
+  // reply to client
+  char reply[] = "HTTP/1.1 200 Connection Established\r\nProxy-Agent: MyProxy/0.1\r\n\r\n";
+  memcpy(rd_wr_buffers[server_fd]->buffer, reply, strlen(reply));
+  rd_wr_buffers[server_fd]->size = strlen(reply);
+  
+  // reset write_buf (client read buffer)
+  write_buf->size = 0;
+  write_buf->size_written = 0;
+  
+  return rd_wr_buffers[server_fd];
 }
 
 int make_socket(uint16_t port) {
@@ -192,7 +419,59 @@ int make_socket(uint16_t port) {
   return sock;
 }
 
-bool is_header_end(char *str, int len) {
+void rd_wr_buf_init() {
+  rd_wr_buffers = (rd_wr_buffer **) calloc(FD_SETSIZE, sizeof(rd_wr_buffer*));
+  write_buffer_lookup = (rd_wr_buffer **) calloc(FD_SETSIZE, sizeof(rd_wr_buffer*));
+}
+
+void cache_init() {
+  cache_arr = (cache_ele **) malloc(CACHE_CAP * sizeof(cache_ele*));
+  for (int i = 0; i < CACHE_CAP; i++) {
+    cache_arr[i] = cache_new();
+    cache_arr[i]->id = i;
+  }
+}
+
+cache_ele* cache_new() {
+  cache_ele *res = (cache_ele *) malloc(sizeof(cache_ele));
+  res->value = response_new();
+  cache_reset(res);
+  return res;
+}
+
+void cache_reset(cache_ele *cache) {
+  cache->key[0] = '\0';
+  cache->expiration_time = 0;
+  response_reset(cache->value);
+}
+
+response_from_server* response_new() {
+  response_from_server *res = (response_from_server *) malloc(sizeof(response_from_server));
+  res->msg = (char *) malloc(RESPONSE_MSG_SIZE * sizeof(char));
+  return res;
+}
+
+void response_reset(response_from_server *response) {
+  bzero(response->msg, RESPONSE_MSG_SIZE);
+  response->body = NULL;
+  response->body_len = 0;
+  response->msg_len = 0;
+}
+
+void rd_wr_buf_new(int fd_id) {
+  rd_wr_buffers[fd_id] = (rd_wr_buffer *) malloc(sizeof(rd_wr_buffer));
+  rd_wr_buffers[fd_id]->buffer = (char *) malloc(RD_WR_BUFFER_SIZE * sizeof(char));
+  rd_wr_buffers[fd_id]->fd_id = fd_id;
+  rd_wr_buf_reset(rd_wr_buffers[fd_id]);
+}
+
+void rd_wr_buf_reset(rd_wr_buffer *buf) {
+  buf->size = 0;
+  buf->size_written = 0;
+  //bzero(buf->buffer, RD_WR_BUFFER_SIZE);
+}
+
+bool is_request_end(char *str, int len) {
   if (str[len - 1] == '\n' && str[len - 2] == '\r' && str[len - 3] == '\n'
       && str[len - 4] == '\r') {
     return true;
@@ -203,7 +482,7 @@ bool is_header_end(char *str, int len) {
 int parse_port_number(char *str) {
   // parse port num if available
   if (str[0] == ':' && str[1] >= '0' && str[1] <= '9') {
-    printf("Parsing port number\n");
+    //printf("Parsing port number\n");
     
     char port_chars[10];
     int i = 0;
@@ -214,7 +493,7 @@ int parse_port_number(char *str) {
     }
     port_chars[i] = '\0';
     
-    printf("Port number is:[%s]\n", port_chars);
+    printf("Parsed Port number is:[%s]\n", port_chars);
     
     return atoi(port_chars);
   }
@@ -222,84 +501,7 @@ int parse_port_number(char *str) {
   return 0;
 }
 
-void client_get_request(int filedes, fd_set *active_fd_set) {
-  int nbytes = 0;
-  request_buffer *tmp_buffer;
-  
-  // read from client to request_buf_arr[filedes]
-  // Initialize the mem if it is NULL
-  if (request_buf_arr[filedes] == NULL) {
-    request_buf_new(filedes);
-  }
-  tmp_buffer = request_buf_arr[filedes];
-  
-  printf("Begin to read from %d\n", filedes);
-  char *end = tmp_buffer->buffer + tmp_buffer->msg_len;
-  int rest_size = REQUEST_BUFFER_SIZE - tmp_buffer->msg_len;
-  tmp_buffer->last_modified_time = time(NULL);
-  nbytes = read(filedes, end, rest_size);
-  printf("Server: got message %d bytes of data.\n", nbytes);
-  
-  /* for test
-  putchar('[');
-  putchar('\n');
-  for (int i = 0; i < nbytes; i++) {
-    printf("%d ", tmp_buffer->buffer[i]);
-  }
-  printf("%s", tmp_buffer->buffer);
-  putchar(']');
-  putchar('\n');
-  */
-  
-  if (nbytes < 0) {
-    // Read error
-    perror("read");
-    exit(EXIT_FAILURE);
-  } else if (nbytes == 0) {
-    // EOF
-    printf("The client closed connection!\n");
-    
-    client_finish(filedes, active_fd_set);
-  } else if (nbytes < REQUEST_BUFFER_SIZE){
-    tmp_buffer->msg_len += nbytes;
-    
-    // if it is a complete msg; complete msg: two consecutive '\n'
-    if (tmp_buffer->msg_len > 4 && is_header_end(tmp_buffer->buffer, tmp_buffer->msg_len)) {
-      // parse it
-      request_from_client *request = request_parse(tmp_buffer);
-      if (request == NULL) {
-        perror("read: invalid request!\n");
-        client_finish(filedes, active_fd_set);
-        return;
-      }
-      
-      // handle CONNECT request
-      if (request->request_method[0] == 'C') {
-        run_connect_meth(filedes, request);
-        client_finish(filedes, active_fd_set);
-        return;
-      }
-      
-      // get the response from cache for GET request
-      response_from_server *response = cache_get(request);
-      
-      // write response to client
-      nbytes = write(filedes, response->msg, response->msg_len);
-      printf("Write %d bytes data to client\n", nbytes);
-      if (nbytes != response->msg_len) {
-        perror("ERROR writing to client socket");
-        exit(EXIT_FAILURE);
-      }
-      
-      client_finish(filedes, active_fd_set);
-    }
-  } else {
-    perror("read: buffer size is not large enough!");
-    exit(EXIT_FAILURE);
-  }
-}
-
-request_from_client* request_parse(request_buffer *req_buf) {
+request_from_client* request_parse(rd_wr_buffer *req_buf) {
   printf("Begin to parse the request from client\n");
   
   // if it is a valid request, return a new request_from_client
@@ -307,8 +509,9 @@ request_from_client* request_parse(request_buffer *req_buf) {
   request->host_name[0] = '\0';
   request->request_method[0] = '\0';
   request->port_num = 80;
-  memcpy(request->msg, req_buf->buffer, req_buf->msg_len);
-  request->msg[req_buf->msg_len] = '\0';
+  memcpy(request->msg, req_buf->buffer, req_buf->size);
+  request->msg[req_buf->size] = '\0';
+  request->is_get_request = true;
   
   int get_len = 4;
   int host_len = 6;
@@ -317,11 +520,11 @@ request_from_client* request_parse(request_buffer *req_buf) {
   char get_header[4] = "GET ";
   char host_header[6] = "Host: ";
   
-  for (int i = 0; i < req_buf->msg_len; i++) {
+  for (int i = 0; i < req_buf->size; i++) {
     char *line = req_buf->buffer + i;
     if (contains_chars(line, get_header, get_len)
         || contains_chars(line, connect_header, connect_len)) {
-      printf("Parsing HTTP request method\n");
+      //printf("Parsing HTTP request method\n");
       
       int j = 0;
       while (req_buf->buffer[i] != '\r') {
@@ -335,8 +538,12 @@ request_from_client* request_parse(request_buffer *req_buf) {
       i++; // now is '\n'
       request->request_method[j] = '\0';
       printf("HTTP request method is:[%s]\n", request->request_method);
+      
+      if (request->request_method[0] == 'C') {
+        request->is_get_request = false;
+      }
     } else if (contains_chars(line, host_header, host_len)) {
-      printf("Parsing host name\n");
+      //printf("Parsing host name\n");
       
       i += host_len;
       int j = 0;
@@ -344,7 +551,7 @@ request_from_client* request_parse(request_buffer *req_buf) {
         request->host_name[j++] = req_buf->buffer[i++];
       }
       request->host_name[j] = '\0';
-      printf("Host is:[%s]\n", request->host_name);
+      printf("Host name is:[%s]\n", request->host_name);
       
       while (req_buf->buffer[i] != '\n') {
         i++;
@@ -377,80 +584,6 @@ bool contains_chars(char *ptr, char *header, int len) {
   return true;
 }
 
-void request_buf_init() {
-  request_buf_arr = (request_buffer **) calloc(FD_SETSIZE, sizeof(request_buffer*));
-}
-
-void request_buf_new(int filedes) {
-  request_buf_arr[filedes] = (request_buffer*) malloc(sizeof(request_buffer));
-  
-  request_buf_arr[filedes]->fd_id = filedes;
-  bzero(request_buf_arr[filedes]->buffer, REQUEST_BUFFER_SIZE);
-  //request_buf_arr[filedes]->last_modified_time = time(NULL);
-  request_buf_arr[filedes]->msg_len = 0;
-}
-
-void request_buf_reset(request_buffer *req_buf) {
-  req_buf->fd_id = -1;
-  bzero(req_buf->buffer, REQUEST_BUFFER_SIZE);
-  req_buf->last_modified_time = 0;
-  req_buf->msg_len = 0;
-}
-
-void client_finish(int filedes, fd_set *active_fd_set) {
-  // reset the buffer
-  request_buf_reset(request_buf_arr[filedes]);
-  
-  // close the connection and clear socket
-  close(filedes);
-  FD_CLR(filedes, active_fd_set);
-}
-
-response_from_server* cache_get(request_from_client *req) {
-  // if NULL or expried, get response from server, save it and parse it  
-  cache_ele* res_cache = cache_find(req->request_method);
-  if (res_cache == NULL || res_cache->expiration_time <= time(NULL)) {
-    printf("No result in the cache or expried, begin to get from server\n");
-    res_cache = cache_new_or_update(res_cache, req);
-  }
-  
-  // return the response
-  return res_cache->value;
-}
-
-void cache_init() {
-  cache_arr = (cache_ele **) malloc(CACHE_CAP * sizeof(cache_ele*));
-  for (int i = 0; i < CACHE_CAP; i++) {
-    cache_arr[i] = cache_new();
-  }
-}
-
-cache_ele* cache_new() {
-  cache_ele *res = (cache_ele *) malloc(sizeof(cache_ele));
-  res->value = response_new();
-  cache_reset(res);
-  return res;
-}
-
-void cache_reset(cache_ele *cache) {
-  cache->key[0] = '\0';
-  cache->expiration_time = 0;
-  response_reset(cache->value);
-}
-
-response_from_server* response_new() {
-  response_from_server *res = (response_from_server *) malloc(sizeof(response_from_server));
-  res->msg = (char *) malloc(RESPONSE_MSG_SIZE * sizeof(char));
-  return res;
-}
-
-void response_reset(response_from_server *response) {
-  bzero(response->msg, RESPONSE_MSG_SIZE);
-  response->body = NULL;
-  response->body_len = 0;
-  response->msg_len = 0;
-}
-
 cache_ele* cache_find(char *key) {
   printf("Trying to find the key [%s] in the cache\n", key);
   for (int i = 0; i < CACHE_CAP; i++) {
@@ -477,7 +610,7 @@ cache_ele* cache_next_free() {
   return cache_arr[res];
 }
 
-cache_ele* cache_new_or_update(cache_ele* node, request_from_client *req) {
+cache_ele* cache_new_or_reset(cache_ele* node, request_from_client *req) {
   // create a new cache node if NULL
   if (node == NULL) {
     node = cache_next_free();
@@ -485,87 +618,10 @@ cache_ele* cache_new_or_update(cache_ele* node, request_from_client *req) {
     printf("New cache with key [%s]\n", req->request_method);
   }
   
-  // update value and expiration_time
-  server_get(node, req);
+  // reset the content of cache
   
   // return the node
   return node;
-}
-
-void server_get(cache_ele *node, request_from_client *req) {
-  response_from_server* response = node->value;
-  struct hostent *server;
-  int sock_fd;
-  struct sockaddr_in server_addr;
-  int nbytes;
-  
-  // socket: create the socket
-  sock_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (sock_fd < 0) {
-    perror("ERROR opening socket\n");
-    exit(EXIT_FAILURE);
-  }
-  
-  // gethostbyname: get the server's DNS entry
-  server = gethostbyname(req->host_name);
-  if (server == NULL) {
-    fprintf(stderr,"ERROR, no such host as %s\n", req->host_name);
-    exit(0);
-  }
-  
-  // build the server's Internet address
-  bzero((char *) &server_addr, sizeof(server_addr));
-  server_addr.sin_family = AF_INET;
-  bcopy((char *)server->h_addr, (char *)&server_addr.sin_addr.s_addr, server->h_length);
-  server_addr.sin_port = htons(req->port_num);
-  
-  // connect: create a connection with the server
-  if (connect(sock_fd, (struct sockaddr *) &server_addr, sizeof(server_addr)) < 0) {
-    perror("ERROR connecting\n");
-    exit(EXIT_FAILURE);      
-  }
-  
-  // send the request to the server
-  nbytes = write(sock_fd, req->msg, strlen(req->msg));
-  //printf("Write msg:[\n%s\n] to the server\n", req->msg);
-  if (nbytes < 0 || strlen(req->msg) != nbytes) {
-    perror("ERROR writing to server socket\n");
-    exit(EXIT_FAILURE);
-  }
-  
-  // read the reply
-  printf("Begin to read from the server\n");
-  nbytes = 0;
-  char *tmp_buf = response->msg;
-  int tmp_n = read(sock_fd, tmp_buf, RESPONSE_MSG_SIZE);
-  
-  while (tmp_n > 0) {
-    printf("Read %d bytes from the server\n", tmp_n);
-    
-    tmp_buf += tmp_n;
-    nbytes += tmp_n;
-    
-    // try to get the content-length so that we can know when the read() is over
-    if (response->body_len == 0) {
-      response_parse(node, nbytes);
-    }
-    
-    // check if it is the last read
-    if (response->body_len != 0 && nbytes == response->body - response->msg + response->body_len) {
-      break;
-    }
-    
-    tmp_n = read(sock_fd, tmp_buf, RESPONSE_MSG_SIZE - nbytes);
-  }
-  if (tmp_n < 0) {
-    perror("ERROR reading from socket\n");
-    exit(EXIT_FAILURE);
-  }
-  
-  printf("Finished reading from the server with %d bytes\n", nbytes);
-  response->msg_len = nbytes;
-  
-  close(sock_fd);
 }
 
 void response_parse(cache_ele *node, int len) {
@@ -621,7 +677,7 @@ void response_parse(cache_ele *node, int len) {
       
       //node->value->body_len = atol(tmp_len);
       parsed_body_len = atol(tmp_len);
-      printf("Expect %ld bytes body from the server\n", node->value->body_len);
+      //printf("Expect %ld bytes body from the server\n", parsed_body_len);
     // get max-age in Cache-Control
     } else if (contains_chars(line, cache_ctrl, len_cache_ctrl)) {
       for (int k = 0; line[k] != '\n'; k++) {
@@ -655,88 +711,4 @@ void response_parse(cache_ele *node, int len) {
       }
     }
   }
-}
-
-void run_connect_meth(int filedes, request_from_client *req) {
-  struct hostent *server;
-  int sock_fd;
-  struct sockaddr_in server_addr;
-  int nbytes;
-  char msg_buf[5000];
-  char reply[] = "HTTP/1.1 200 Connection Established\r\nProxy-Agent: MyProxy/0.1\r\n\r\n";
-  
-  // write response to client
-  nbytes = write(filedes, reply, strlen(reply));
-  printf("Write %d bytes data to client\n", nbytes);
-  if (nbytes != strlen(reply)) {
-    perror("ERROR writing to client socket\n");
-    exit(EXIT_FAILURE);
-  }
-  
-  // get request from client
-  bzero(msg_buf, 5000);
-  nbytes = read(filedes, msg_buf, 5000);
-  printf("Get %d bytes data request from client\n", nbytes);
-  
-  // socket: create the socket to connect the server
-  sock_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (sock_fd < 0) {
-    perror("ERROR opening socket\n");
-    exit(EXIT_FAILURE);
-  }
-  
-  // gethostbyname: get the server's DNS entry
-  server = gethostbyname(req->host_name);
-  if (server == NULL) {
-    fprintf(stderr,"ERROR, no such host as %s\n", req->host_name);
-    exit(0);
-  }
-  
-  // build the server's Internet address
-  bzero((char *) &server_addr, sizeof(server_addr));
-  server_addr.sin_family = AF_INET;
-  bcopy((char *)server->h_addr, (char *)&server_addr.sin_addr.s_addr, server->h_length);
-  server_addr.sin_port = htons(req->port_num);
-  
-  // connect: create a connection with the server
-  if (connect(sock_fd, (struct sockaddr *) &server_addr, sizeof(server_addr)) < 0) {
-    perror("ERROR connecting\n");
-    exit(EXIT_FAILURE);      
-  }
-  
-  // send the request to the server
-  nbytes = write(sock_fd, msg_buf, nbytes);
-  printf("Forward %d bytes data request to the server\n", nbytes);
-  
-  // begin to get data
-  printf("Begin to get msg body from the server\n", nbytes);
-  bzero(msg_buf, 5000);
-  nbytes = read(sock_fd, msg_buf, 5000);
-  
-  // wait for the last ACK is complete
-  while (nbytes > 0) {
-    // write to the client
-    nbytes = write(filedes, msg_buf, nbytes);
-    printf("Forward %d bytes to the client\n", nbytes);
-    
-    
-    // attempt read the reply from client
-    bzero(msg_buf, 5000);
-    nbytes = read(filedes, msg_buf, 5000);
-    if (nbytes > 0) {
-      printf("Get %d bytes data from the client: Connection-Ack\n", nbytes);
-      // forward the reply to the server
-      nbytes = write(sock_fd, msg_buf, nbytes);
-      printf("Forward %d bytes data request to the server\n", nbytes);
-    }
-    
-    
-    // read from the server
-    bzero(msg_buf, 5000);
-    nbytes = read(sock_fd, msg_buf, 5000);
-  }
-  
-  printf("Finished CONNECT!\n");
-  
-  close(sock_fd);
 }
